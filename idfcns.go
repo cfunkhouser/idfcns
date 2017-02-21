@@ -1,3 +1,5 @@
+// The idfcns allows forwarding DNS queries to different upstream servers
+// depending on the query type.
 package main
 
 import (
