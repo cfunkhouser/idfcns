@@ -78,7 +78,7 @@ func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
 	// each. A future optimization might be to group questions with the same
 	// QType into the same message if it turns out this is a bottleneck.
 	answ := make([]dns.RR, 0)
-	var failed bool
+	var rcode int
 	for _, q := range req.Question {
 		m := req.Copy()
 		m.Question = []dns.Question{q}
@@ -86,24 +86,25 @@ func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
 		r, _, err := f.c.Exchange(m, net.JoinHostPort(server, "53"))
 		if err != nil {
 			log.Printf("query errored: %v\nquery: %+v", err, m)
-			failed = true
+			rcode = dns.RcodeServerFailure
 			break
 		}
 		if r.Rcode != dns.RcodeSuccess {
 			log.Printf("query did not succeed: %v\nquery: %+v", dns.RcodeToString[r.Rcode], m)
-			failed = true
+			rcode = r.Rcode // Copy the first error and bail.
 			break
 		}
 		answ = append(answ, r.Answer...)
 	}
-	if failed {
-		// Handle failure here.
-		log.Print("forward failed")
-	}
+
 	resp := &dns.Msg{}
-	resp.Answer = answ
-	resp.Authoritative = false
 	resp.SetReply(req)
+	if rcode != dns.RcodeSuccess {
+		resp.Rcode = rcode
+	} else {
+		resp.Answer = answ
+		resp.Authoritative = false
+	}
 	log.Printf("Responding with:\n%+v", resp)
 	w.WriteMsg(resp)
 }
