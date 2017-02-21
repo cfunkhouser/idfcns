@@ -1,112 +1,145 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
+
+	"io/ioutil"
+
+	"encoding/json"
 
 	"github.com/miekg/dns"
 )
 
 var (
-	// Domain handled by this server.
-	Domain = "home.idontfixcomputers.com."
-
-	// DefaultTTL of records returned by this server.
-	DefaultTTL = 7200 // Two hours
+	domain   = flag.String("domain", ".", "Domain to be handled by this server.")
+	address  = flag.String("address", ":53", "Host-port on which to listen (both UDP and TCP.)")
+	confFile = flag.String("config", "", "Path to the configuration file.")
 )
 
-// NameServer is a simple DNS server designed to be quickly configured and
-// run inside of Docker. It allows configuring forwarders per query type.
-type NameServer struct {
-	mu         sync.RWMutex                 // Protects the following fields
-	records    map[string]map[uint16]string // name => qtype => value
-	forwarders map[string]string            // qtype => forwarder
+// ForwarderConfig contains all options for creating a QTypeForwarder.
+type ForwarderConfig struct {
+	// ServerOverrides maps query types to an alternate set of Servers to search.
+	ServerOverrides map[string][]string `json:"qtype_overrides"`
+
+	// The default DNS servers for forwarded requests.
+	Servers []string `json:"servers"`
 }
 
-func (s *NameServer) Handle(w dns.ResponseWriter, r *dns.Msg) {
-	log.Printf("Received request with %v questions", len(r.Question))
-	m := &dns.Msg{}
-	m.SetReply(r)
-	m.Authoritative = true // TODO(christian): Change this.
-	answ := make([]dns.RR, 0)
-	// For each QUESTION:
-	for _, q := range r.Question {
-		log.Printf("Looking for %q in %v", q.Name, q.Qtype)
-		// Check name for existence in records
-		var rec dns.RR
-		if qvm, ok := s.records[q.Name]; ok {
-			if v, stillOK := qvm[q.Qtype]; stillOK {
-				log.Printf("I should know how to handle %v for %q", q.Qtype, q.Name)
+// ForwarderConfigFromJSON gets a ForwarderConfig from a JSON file.
+func ForwarderConfigFromJSON(path string) (*ForwarderConfig, error) {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	c := &ForwarderConfig{}
+	if err := json.Unmarshal(b, c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
 
-				hdr := dns.RR_Header{
-					Name:   q.Name,
-					Rrtype: q.Qtype,
-					Class:  dns.ClassINET,
-					Ttl:    uint32(DefaultTTL),
-				}
+// QTypeForwarder is a DNS forwarder which forwards DNS queries to a particular
+// upstream DNS server based on the query type.
+type QTypeForwarder struct {
+	forwarders map[uint16][]string // qtype => server
+	catchall   []string            // default forwarder
+	c          *dns.Client
+}
 
-				// TODO(christian): this is gross, break it out.
-				switch q.Qtype {
-				case dns.TypeA:
-					rec = &dns.A{
-						Hdr: hdr,
-						A:   net.ParseIP(v),
-					}
-				case dns.TypeAAAA:
-					rec = &dns.AAAA{
-						Hdr:  hdr,
-						AAAA: net.ParseIP(v),
-					}
-				}
-			}
-		}
-		// Don't have it? Forward that sucker.
-		// TODO(christian): Forward that sucker.
-		if rec != nil {
-			answ = append(answ, rec)
-			rec = nil
+// NewQTypeForwarder creates a new QTypeForwarder.
+func NewQTypeForwarder(config *ForwarderConfig) *QTypeForwarder {
+	forwarders := make(map[uint16][]string)
+	if config.ServerOverrides == nil || len(config.ServerOverrides) == 0 {
+		log.Printf("empty overrides, all requests going to %v", config.Servers)
+	} else {
+		log.Printf("default: %v", config.Servers)
+		for q, s := range config.ServerOverrides {
+			log.Printf("override %v => %v", q, s)
+			forwarders[dns.StringToType[q]] = s
 		}
 	}
-	m.Answer = answ
-	log.Printf("Responding with:\n%+v", m)
-	w.WriteMsg(m)
+	return &QTypeForwarder{
+		forwarders: forwarders,
+		catchall:   config.Servers,
+		c:          &dns.Client{},
+	}
+}
+
+// Handle a DNS query. Meant to be passed to dns.HandleFunc.
+func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
+	// Handle questions. Because we are sorting on QType, we need to break out
+	// messages with multiple questions into multiple messages with one question
+	// each. A future optimization might be to group questions with the same
+	// QType into the same message if it turns out this is a bottleneck.
+	answ := make([]dns.RR, 0)
+	var failed bool
+	for _, q := range req.Question {
+		m := req.Copy()
+		m.Question = []dns.Question{q}
+		server := f.serverForQuestion(&q)
+		r, _, err := f.c.Exchange(m, net.JoinHostPort(server, "53"))
+		if err != nil {
+			log.Printf("query errored: %v\nquery: %+v", err, m)
+			failed = true
+			break
+		}
+		if r.Rcode != dns.RcodeSuccess {
+			log.Printf("query did not succeed: %v\nquery: %+v", dns.RcodeToString[r.Rcode], m)
+			failed = true
+			break
+		}
+		answ = append(answ, r.Answer...)
+	}
+	if failed {
+		// Handle failure here.
+		log.Print("forward failed")
+	}
+	resp := &dns.Msg{}
+	resp.Answer = answ
+	resp.Authoritative = false
+	resp.SetReply(req)
+	log.Printf("Responding with:\n%+v", resp)
+	w.WriteMsg(resp)
+}
+
+func (f *QTypeForwarder) serverForQuestion(q *dns.Question) string {
+	// TODO(christian): Don't ignore all but the first server.
+	if s, ok := f.forwarders[q.Qtype]; ok {
+		return s[0]
+	}
+	return f.catchall[0]
 }
 
 func main() {
-	fmt.Println("Starting DNS server")
+	flag.Parse()
 
-	ns := &NameServer{
-		records: map[string]map[uint16]string{
-			"foo.home.idontfixcomputers.com.": map[uint16]string{
-				dns.TypeA:    "10.42.6.254",
-				dns.TypeAAAA: "2602:100:615f:f53e:a2a:6fe::",
-			},
-		},
+	config, err := ForwarderConfigFromJSON(*confFile)
+	if err != nil {
+		log.Fatalf("Couldn't load config file %q: %v", *confFile, err)
 	}
-
-	dns.HandleFunc(Domain, ns.Handle)
-	go func() {
-		srv := &dns.Server{Addr: ":8053", Net: "udp"}
-		err := srv.ListenAndServe()
-		if err != nil {
-			log.Fatalf("Failed to set udp listener %s\n", err.Error())
-		}
-	}()
-	go func() {
-		srv := &dns.Server{Addr: ":8053", Net: "tcp"}
-		err := srv.ListenAndServe()
-		if err != nil {
-			log.Fatalf("Failed to set tcp listener %s\n", err.Error())
-		}
-	}()
+	f := NewQTypeForwarder(config)
+	dns.HandleFunc(*domain, f.Handle)
 
 	sig := make(chan os.Signal)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	fmt.Println("Starting DNS forwarder")
+	for _, p := range []string{"udp", "tcp"} {
+		go func(proto string) {
+			srv := &dns.Server{Addr: *address, Net: proto}
+			err := srv.ListenAndServe()
+			if err != nil {
+				log.Fatalf("Failed to create %v listener: %v", proto, err)
+			}
+		}(p)
+	}
+
 	s := <-sig
 	fmt.Printf("Signal (%s) received, stopping\n", s)
 }
