@@ -6,10 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"io/ioutil"
 
@@ -85,6 +87,7 @@ func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
 		m := req.Copy()
 		m.Question = []dns.Question{q}
 		server := f.serverForQuestion(&q)
+		log.Printf("Forwarding to %v", server)
 		r, _, err := f.c.Exchange(m, net.JoinHostPort(server, "53"))
 		if err != nil {
 			log.Printf("query errored: %v\nquery: %+v", err, m)
@@ -112,14 +115,18 @@ func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
 }
 
 func (f *QTypeForwarder) serverForQuestion(q *dns.Question) string {
-	// TODO(christian): Don't ignore all but the first server.
-	if s, ok := f.forwarders[q.Qtype]; ok {
-		return s[0]
+	s := f.catchall
+	if fs, ok := f.forwarders[q.Qtype]; ok {
+		s = fs
 	}
-	return f.catchall[0]
+	if l := len(s); l > 1 {
+		return s[rand.Intn(l)]
+	}
+	return s[0]
 }
 
 func main() {
+	rand.Seed(time.Now().Unix())
 	flag.Parse()
 
 	config, err := ForwarderConfigFromJSON(*confFile)
