@@ -87,7 +87,6 @@ func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
 		m := req.Copy()
 		m.Question = []dns.Question{q}
 		server := f.serverForQuestion(&q)
-		log.Printf("Forwarding to %v", server)
 		r, _, err := f.c.Exchange(m, net.JoinHostPort(server, "53"))
 		if err != nil {
 			log.Printf("query errored: %v\nquery: %+v", err, m)
@@ -95,7 +94,7 @@ func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
 			break
 		}
 		if r.Rcode != dns.RcodeSuccess {
-			log.Printf("query did not succeed: %v\nquery: %+v", dns.RcodeToString[r.Rcode], m)
+			log.Printf("Query did not succeed: %v\nquery: %+v", dns.RcodeToString[r.Rcode], m)
 			rcode = r.Rcode // Copy the first error and bail.
 			break
 		}
@@ -110,7 +109,6 @@ func (f *QTypeForwarder) Handle(w dns.ResponseWriter, req *dns.Msg) {
 		resp.Answer = answ
 		resp.Authoritative = false
 	}
-	log.Printf("Responding with:\n%+v", resp)
 	w.WriteMsg(resp)
 }
 
